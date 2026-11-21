@@ -3,3 +3,5 @@ dev/
 out/
 *.md
 .git
+native/target/
+out20/

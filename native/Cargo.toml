@@ -1,0 +1,16 @@
+[package]
+name = "sessions"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+hashbrown = "0.15"
+memchr = "2"
+memmap2 = "0.9"
+parquet = { version = "54", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

@@ -221,7 +221,7 @@ fn bucket(h: u64) -> usize {
     ((h >> 40) as usize) & (P - 1)
 }
 
-const PD: usize = 512; // dedup buckets (power of two)
+const PD: usize = 2048; // dedup buckets (power of two)
 
 #[inline]
 fn dbucket(h: u64) -> usize {
@@ -326,6 +326,9 @@ fn civil(y: i64, m: i64, d: i64) -> i64 {
 #[inline]
 fn ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
+    if n == 20 && b[10] == b'T' {
+        return iso_z(b);
+    }
     if (n == 20 || n == 25) && b[10] == b'T' {
         return iso(b);
     }
@@ -371,6 +374,52 @@ fn parse8(x: u64) -> u64 {
     let v = (v.wrapping_mul(10)).wrapping_add(v >> 8) & 0x00FF_00FF_00FF_00FF;
     let v = (v.wrapping_mul(100)).wrapping_add(v >> 16) & 0x0000_FFFF_0000_FFFF;
     (v.wrapping_mul(10000)).wrapping_add(v >> 32) & 0xFFFF_FFFF
+}
+
+/// ts() for 20-byte input: the "...Z" ISO form, None for anything else.
+#[inline(always)]
+fn iso_z(b: &[u8]) -> Option<i64> {
+    const M1: u64 = 0x00FF_FF00_FFFF_FFFF; // "YYYY-MM-" digit bytes
+    const M2: u64 = 0xFFFF_00FF_FF00_FFFF; // "DDTHH:MM"
+    const M3: u64 = 0x00FF_FF00; // ":SSZ"
+    const Z: u64 = 0x3030_3030_3030_3030;
+    let x1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let x2 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    let x3 = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64;
+    if x1 & !M1 != 0x2D00_002D_0000_0000
+        || x2 & !M2 != 0x0000_3A00_0054_0000
+        || x3 & !M3 != 0x5A00_003A
+        || !digits_ok(x1, M1)
+        || !digits_ok(x2, M2)
+        || !digits_ok(x3, M3)
+    {
+        return None;
+    }
+    // digit values (separators zeroed); byte k of w = 10 * digit k + digit k+1
+    let (v1, v2, v3) = ((x1 ^ Z) & M1, (x2 ^ Z) & M2, (x3 ^ Z) & M3);
+    let (w1, w2, w3) = (v1 * 10 + (v1 >> 8), v2 * 10 + (v2 >> 8), v3 * 10 + (v3 >> 8));
+    let y = (w1 & 0xFF) * 100 + ((w1 >> 16) & 0xFF);
+    let mo = (w1 >> 40) & 0xFF;
+    let d = w2 & 0xFF;
+    let h = (w2 >> 24) & 0xFF;
+    let mi = (w2 >> 48) & 0xFF;
+    let sec = (w3 >> 8) & 0xFF;
+    if mo.wrapping_sub(1) >= 12 || d == 0 || h > 23 || mi > 59 || sec > 59 {
+        return None;
+    }
+    if d > 28 {
+        const DIM: [u64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        if d > DIM[mo as usize] + (mo == 2 && leap) as u64 {
+            return None;
+        }
+    }
+    // days_from_civil, shifted 400 years so everything stays unsigned
+    let yy = y + 400 - (mo <= 2) as u64;
+    let mp = if mo > 2 { mo - 3 } else { mo + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let days = (yy * 365 + yy / 4 - yy / 100 + yy / 400 + doy) as i64 - 719_468 - 146_097;
+    Some(((days * 24 + h as i64) * 60 + mi as i64) * 60_000 + sec as i64 * 1000)
 }
 
 #[inline]
@@ -931,14 +980,31 @@ impl Links {
             tabs.push(t);
         }
         // 4. person = byte-wise smallest id of the component
-        let mut best: Vec<u32> = (0..n as u32).collect();
-        for i in 0..n {
-            let r = find(&mut parent, i as u32) as usize;
-            parent[i] = r as u32;
-            if ids[i].get() < ids[best[r] as usize].get() {
-                best[r] = i as u32;
-            }
+        let bestc: Vec<std::sync::atomic::AtomicU32> = (0..n as u32).map(std::sync::atomic::AtomicU32::new).collect();
+        {
+            let par = &parent[..];
+            let step = n.div_ceil(threads * 8).max(1);
+            par_map(n.div_ceil(step), threads, |c| {
+                for i in c * step..((c + 1) * step).min(n) {
+                    let mut r = i as u32;
+                    while par[r as usize] != r {
+                        r = par[r as usize];
+                    }
+                    let r = r as usize;
+                    if r != i {
+                        let mine = ids[i].get();
+                        let mut cur = bestc[r].load(Ordering::Relaxed);
+                        while mine < ids[cur as usize].get() {
+                            match bestc[r].compare_exchange_weak(cur, i as u32, Ordering::Relaxed, Ordering::Relaxed) {
+                                Ok(_) => break,
+                                Err(x) => cur = x,
+                            }
+                        }
+                    }
+                }
+            });
         }
+        let best: Vec<u32> = bestc.into_iter().map(|a| a.into_inner()).collect();
         drop(tabs);
         let rtabs: Vec<Vec<RE>> = par_map(Q, threads, |q| {
             let (a, b) = (soff[q] as usize, soff[q + 1] as usize);
@@ -947,7 +1013,11 @@ impl Links {
             let mut t = vec![RE::default(); size];
             for i in a..b {
                 let h = hs[i];
-                let r = best[parent[i] as usize] as usize;
+                let mut x = i as u32;
+                while parent[x as usize] != x {
+                    x = parent[x as usize];
+                }
+                let r = best[x as usize] as usize;
                 let mut j = (h >> 24) as usize & mask;
                 while t[j].hk != 0 {
                     j = (j + 1) & mask;
@@ -1624,38 +1694,94 @@ fn main() {
     // ---- per person (a person is identified by its 64-bit name hash) ----
     let ncat = cats.len();
     let evq: Vec<std::sync::Mutex<Vec<EvB>>> = evq.into_iter().map(std::sync::Mutex::new).collect();
-    let ctxs: Vec<Ctx> = par_map(P, threads, |p| {
-        let mut ev = evq[p].lock().unwrap();
-        ev.sort_unstable_by_key(|e| (e.ph, e.ts));
-        let mut ck: Vec<Clk> =
-            Vec::with_capacity(states.iter().map(|st| st.1[p].iter().map(|v| v.len()).sum::<usize>()).sum());
-        for st in &states {
-            for v in &st.1[p] {
-                ck.extend_from_slice(v);
+    const SB: usize = 1 << 16;
+    let sub = |ph: u64| (ph & (SB as u64 - 1)) as usize;
+    let maxev = tot.iter().copied().max().unwrap_or(0);
+    let ctxs: Vec<Ctx> = par_map_init(
+        P,
+        threads,
+        || (Vec::<EvB>::with_capacity(maxev), vec![0u32; SB + 1], vec![0u32; SB + 1], vec![0u32; SB]),
+        |buf, p| {
+            let (es, eo, co, pos) = buf;
+            let src = evq[p].lock().unwrap();
+            let n = src.len();
+            eo.fill(0);
+            for e in src.iter() {
+                eo[sub(e.ph) + 1] += 1;
             }
-        }
-        ck.sort_unstable_by(|a, b| (a.ph, a.ts).cmp(&(b.ph, b.ts)).then_with(|| a.cid.get().cmp(b.cid.get())));
-        let mut ctx = Ctx::new(ncamp, ncat, ndays, day0);
-        let (mut i, mut j) = (0usize, 0usize);
-        while i < ev.len() {
-            let ph = ev[i].ph;
-            let mut ie = i + 1;
-            while ie < ev.len() && ev[ie].ph == ph {
-                ie += 1;
+            for g in 0..SB {
+                eo[g + 1] += eo[g];
             }
-            while j < ck.len() && ck[j].ph < ph {
-                j += 1;
+            pos.copy_from_slice(&eo[..SB]);
+            es.clear();
+            let d = es.as_mut_ptr();
+            for e in src.iter() {
+                let g = sub(e.ph);
+                unsafe { d.add(pos[g] as usize).write(*e) };
+                pos[g] += 1;
             }
-            let mut je = j;
-            while je < ck.len() && ck[je].ph == ph {
-                je += 1;
+            unsafe { es.set_len(n) };
+            drop(src);
+
+            co.fill(0);
+            let mut nck = 0usize;
+            for st in &states {
+                for v in &st.1[p] {
+                    nck += v.len();
+                    for c in v {
+                        co[sub(c.ph) + 1] += 1;
+                    }
+                }
             }
-            ctx.person(ev[i].person.get(), &ev[i..ie], &ck[j..je]);
-            i = ie;
-            j = je;
-        }
-        ctx
-    });
+            for g in 0..SB {
+                co[g + 1] += co[g];
+            }
+            pos.copy_from_slice(&co[..SB]);
+            let mut cks: Vec<Clk> = Vec::with_capacity(nck);
+            let d = cks.as_mut_ptr();
+            for st in &states {
+                for v in &st.1[p] {
+                    for c in v {
+                        let g = sub(c.ph);
+                        unsafe { d.add(pos[g] as usize).write(*c) };
+                        pos[g] += 1;
+                    }
+                }
+            }
+            unsafe { cks.set_len(nck) };
+
+            let mut ctx = Ctx::new(ncamp, ncat, ndays, day0);
+            for g in 0..SB {
+                let (ea, eb) = (eo[g] as usize, eo[g + 1] as usize);
+                if ea == eb {
+                    continue;
+                }
+                let ev = &mut es[ea..eb];
+                ev.sort_unstable_by_key(|e| (e.ph, e.ts));
+                let ck = &mut cks[co[g] as usize..co[g + 1] as usize];
+                ck.sort_unstable_by(|a, b| (a.ph, a.ts).cmp(&(b.ph, b.ts)).then_with(|| a.cid.get().cmp(b.cid.get())));
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < ev.len() {
+                    let ph = ev[i].ph;
+                    let mut ie = i + 1;
+                    while ie < ev.len() && ev[ie].ph == ph {
+                        ie += 1;
+                    }
+                    while j < ck.len() && ck[j].ph < ph {
+                        j += 1;
+                    }
+                    let mut je = j;
+                    while je < ck.len() && ck[je].ph == ph {
+                        je += 1;
+                    }
+                    ctx.person(ev[i].person.get(), &ev[i..ie], &ck[j..je]);
+                    i = ie;
+                    j = je;
+                }
+            }
+            ctx
+        },
+    );
     log("sessions done");
 
     // ---- outputs ----

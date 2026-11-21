@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 native/target/
 out20/
+native3/target/
+native3/target-dbg/

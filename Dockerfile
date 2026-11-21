@@ -1,8 +1,8 @@
-# Shopping Sessions: native (Rust) pipeline, v2.
+# Shopping Sessions: native (Rust) pipeline, v3. v2 kept as Dockerfile.native.
 FROM rust:1.85-slim-bookworm AS build
 WORKDIR /src
-COPY native/Cargo.toml native/Cargo.lock ./
-COPY native/src ./src
+COPY native3/Cargo.toml native3/Cargo.lock ./
+COPY native3/src ./src
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
